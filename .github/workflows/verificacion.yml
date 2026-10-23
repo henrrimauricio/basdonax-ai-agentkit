@@ -45,7 +45,17 @@ jobs:
       - name: Análisis estático (ruff)
         id: ruff
         continue-on-error: true
-        run: ruff check --output-format concise . 2>&1 | tee ruff.txt
+        run: |
+          # Primero los errores reales (pyflakes, sintaxis, bugs típicos) en el
+          # código del agente; esto es lo que decide el ✅/❌. El estilo va
+          # aparte, como estadística, y no hace fallar el chequeo.
+          ruff check --no-cache --statistics --exit-zero . > ruff_estilo.txt 2>&1
+          ruff check --no-cache --select F,E9,B,PLE --output-format concise \
+            src webhook_chatwoot.py bot_telegram.py chat.py servidor.py \
+            conectar_gmail.py probar_mail.py 2>&1 | tee ruff.txt
+          echo >> ruff.txt
+          echo "--- Estilo (todo el repo, no hace fallar) ---" >> ruff.txt
+          cat ruff_estilo.txt >> ruff.txt
 
       - name: Seguridad del código (bandit, severidad media o alta)
         id: bandit
