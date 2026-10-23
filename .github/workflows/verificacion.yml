@@ -1,0 +1,149 @@
+# Verificación completa del Agent Kit, en los servidores de GitHub.
+#
+# Corre los tests del repo, análisis estático, escaneo de seguridad, el build
+# de Docker con una prueba de humo, y un script que reproduce los hallazgos
+# del análisis. No usa ninguna clave real: el modelo y Chatwoot son simulados.
+#
+# El resultado queda como comentario en el pull request y en el resumen del run.
+
+name: Verificación
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r requirements-produccion.txt
+          pip install ruff bandit pip-audit
+
+      - name: Tests del repo (pytest)
+        id: tests
+        continue-on-error: true
+        run: pytest -q -rfE 2>&1 | tee tests.txt
+
+      - name: Análisis estático (ruff)
+        id: ruff
+        continue-on-error: true
+        run: |
+          # Primero los errores reales (pyflakes, sintaxis, bugs típicos) en el
+          # código del agente; esto es lo que decide el ✅/❌. El estilo va
+          # aparte, como estadística, y no hace fallar el chequeo.
+          ruff check --no-cache --statistics --exit-zero . > ruff_estilo.txt 2>&1
+          ruff check --no-cache --select F,E9,B,PLE --output-format concise \
+            src webhook_chatwoot.py bot_telegram.py chat.py servidor.py \
+            conectar_gmail.py probar_mail.py 2>&1 | tee ruff.txt
+          echo >> ruff.txt
+          echo "--- Estilo (todo el repo, no hace fallar) ---" >> ruff.txt
+          cat ruff_estilo.txt >> ruff.txt
+
+      - name: Seguridad del código (bandit, severidad media o alta)
+        id: bandit
+        continue-on-error: true
+        run: |
+          bandit -q -ll -r src webhook_chatwoot.py bot_telegram.py chat.py servidor.py \
+            conectar_gmail.py probar_mail.py 2>&1 | tee bandit.txt
+
+      - name: Vulnerabilidades conocidas en dependencias (pip-audit)
+        id: audit
+        continue-on-error: true
+        run: pip-audit -r requirements-produccion.txt --progress-spinner off 2>&1 | tee audit.txt
+
+      - name: Build de Docker y prueba de humo
+        id: docker
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          docker build -t agentkit . 2>&1 | tail -n 15 | tee docker.txt
+          TOKEN=$(python -c "import secrets; print(secrets.token_hex(24))")
+          docker run -d --name agentkit -p 8000:8000 \
+            -e PROVEEDOR=claude -e ANTHROPIC_API_KEY=sk-falsa-solo-para-arrancar \
+            -e MODO=test \
+            -e CHATWOOT_URL=https://chatwoot.ejemplo.com -e CHATWOOT_TOKEN=falso \
+            -e CHATWOOT_WEBHOOK_TOKEN="$TOKEN" agentkit
+          for i in $(seq 1 30); do
+            if curl -fsS localhost:8000/salud > salud.json; then break; fi
+            sleep 1
+          done
+          echo "--- /salud ---" | tee -a docker.txt
+          cat salud.json | tee -a docker.txt
+          echo | tee -a docker.txt
+          echo "--- usuario del proceso ---" | tee -a docker.txt
+          docker exec agentkit id | tee -a docker.txt
+          echo "--- token NO debe aparecer en los logs ---" | tee -a docker.txt
+          curl -s -o /dev/null -X POST "localhost:8000/chatwoot/$TOKEN" -H 'Content-Type: application/json' -d '{}'
+          sleep 1
+          if docker logs agentkit 2>&1 | grep -q "$TOKEN"; then
+            echo "FALLA: el token aparece en los logs" | tee -a docker.txt; exit 1
+          else
+            echo "OK: el token no aparece en los logs" | tee -a docker.txt
+          fi
+          curl -fsS localhost:8000/salud > /dev/null
+
+      - name: Reproducir los hallazgos del análisis
+        id: hallazgos
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          timeout 600 python verificacion/hallazgos.py 2>&1 | tee hallazgos.md
+
+      - name: Armar el reporte
+        if: always()
+        run: |
+          icono() { [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          ultimas() { echo '```'; tail -n "$2" "$1" 2>/dev/null | cut -c1-300; echo '```'; }
+          {
+            echo "## Verificación del Agent Kit"
+            echo
+            echo "Python 3.13 · ubuntu-latest · commit \`${GITHUB_SHA::7}\`"
+            echo
+            echo "| Chequeo | Resultado |"
+            echo "|---|---|"
+            echo "| Tests del repo (pytest) | $(icono '${{ steps.tests.outcome }}') |"
+            echo "| Análisis estático (ruff) | $(icono '${{ steps.ruff.outcome }}') |"
+            echo "| Seguridad del código (bandit) | $(icono '${{ steps.bandit.outcome }}') |"
+            echo "| Dependencias vulnerables (pip-audit) | $(icono '${{ steps.audit.outcome }}') |"
+            echo "| Docker: build + arranque + /salud + token fuera de logs | $(icono '${{ steps.docker.outcome }}') |"
+            echo "| Script de hallazgos ejecutado | $(icono '${{ steps.hallazgos.outcome }}') |"
+            echo
+            echo "### Hallazgos del análisis"
+            echo
+            cat hallazgos.md 2>/dev/null || echo "_No se generó._"
+            echo
+            echo "<details><summary>pytest</summary>"; echo; ultimas tests.txt 40; echo "</details>"
+            echo "<details><summary>ruff</summary>"; echo; ultimas ruff.txt 40; echo "</details>"
+            echo "<details><summary>bandit</summary>"; echo; ultimas bandit.txt 60; echo "</details>"
+            echo "<details><summary>pip-audit</summary>"; echo; ultimas audit.txt 40; echo "</details>"
+            echo "<details><summary>docker</summary>"; echo; ultimas docker.txt 40; echo "</details>"
+          } > reporte.md
+          cat reporte.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar el reporte en el pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --repo "$GITHUB_REPOSITORY" --body-file reporte.md
+
+      - name: Fallar si los tests del repo fallaron
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
