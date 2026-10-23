@@ -1247,7 +1247,8 @@ def test_reset_borra_la_memoria_de_una_conversacion():
 
     with cliente(ChatwootFalso(), agente) as web:
         web.post(f"/chatwoot/{TOKEN}", json=evento("hola", conversacion=12))
-        assert agente.historial("12")
+        # La respuesta sale en segundo plano: se espera a que quede guardada.
+        assert esperar(lambda: agente.historial("12"))
 
         assert web.post(f"/reset/{TOKEN}", json={"conversacion": "12"}).json() == {
             "estado": "ok", "conversacion": "12"}
