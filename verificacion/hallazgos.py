@@ -163,7 +163,8 @@ def h1_bloqueo_del_event_loop() -> tuple[bool, str]:
     return confirmado, (
         f"Con Chatwoot tardando {demora:.0f}s en devolver etiquetas, `GET /salud` "
         f"(que no hace nada) tardó **{latencia:.2f}s** (status {salud.status_code}). "
-        "Mientras dura esa consulta, el servidor no atiende ningún otro pedido."
+        + ("Mientras dura esa consulta, el servidor no atiende ningún otro pedido."
+           if confirmado else "El servidor sigue atendiendo mientras espera a Chatwoot.")
     )
 
 
@@ -259,8 +260,9 @@ def h5_buffer_cero_retiene_el_200() -> tuple[bool, str]:
     confirmado = latencia > modelo_s * 0.8
     return confirmado, (
         f"Con `BUFFER_SEGUNDOS=0` y un modelo que tarda {modelo_s:.0f}s, el 200 a Chatwoot "
-        f"tardó **{latencia:.2f}s** (status {r.status_code}). Con buffer > 0 sale enseguida. "
-        "Un modelo lento con buffer 0 puede hacer que Chatwoot dé el webhook por fallado."
+        f"tardó **{latencia:.2f}s** (status {r.status_code}). "
+        + ("Un modelo lento con buffer 0 puede hacer que Chatwoot dé el webhook por fallado."
+           if confirmado else "El 200 sale enseguida y la respuesta va en segundo plano.")
     )
 
 

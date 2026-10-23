@@ -655,13 +655,18 @@ def test_al_pasar_el_tope_pasa_a_una_persona_y_se_calla():
     canal = ChatwootFalso()
     agente = agente_falso(["uno", "dos", "no debería usarse"])
 
+    def mandar(i):
+        return web.post(f"/chatwoot/{TOKEN}", json=evento("hola", id_mensaje=i)).json()["estado"]
+
     with cliente(canal, agente, tope=TopeDeMensajes(2)) as web:
-        estados = [
-            web.post(f"/chatwoot/{TOKEN}", json=evento("hola", id_mensaje=i)).json()[
-                "estado"
-            ]
-            for i in (1, 2, 3, 4)
-        ]
+        # Las respuestas salen en segundo plano (el 200 no espera al modelo):
+        # se espera a que salgan las dos que entran en el tope antes de
+        # pasarlo. Si no, la etiqueta del tercero llega antes de mandar la
+        # segunda y la segunda mirada la frena — que en producción es lo
+        # correcto, pero acá se prueba otra cosa.
+        estados = [mandar(1), mandar(2)]
+        assert esperar(lambda: len(canal.envios()) == 2), "las dos primeras se contestan"
+        estados += [mandar(3), mandar(4)]
         assert esperar(lambda: canal.etiquetas_mandadas()), "tendría que haber puesto la etiqueta"
 
     assert estados == ["recibido", "recibido", "tope", "tope"]
