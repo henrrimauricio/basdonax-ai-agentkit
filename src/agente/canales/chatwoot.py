@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -117,6 +118,11 @@ class Chatwoot(Canal):
         # le respondemos rápido, y sin esto el agente contesta dos veces lo
         # mismo. Alcanza con acordarse de los últimos.
         self._ya_contestados: deque[str] = deque(maxlen=1000)
+        # El webhook llama a deberia_responder() desde un hilo aparte (puede
+        # tener que preguntarle las etiquetas a Chatwoot, y eso no puede trabar
+        # el servidor). Dos reintentos del mismo mensaje pueden caer a la vez
+        # en dos hilos: sin este candado, los dos verían el id como nuevo.
+        self._candado_de_ids = threading.Lock()
 
     # -- Entrada ---------------------------------------------------------------
 
@@ -177,9 +183,16 @@ class Chatwoot(Canal):
             return False
 
         # 3. El mismo mensaje dos veces. Chatwoot reintenta si el webhook no
-        #    contestó a tiempo, y el reintento trae el mismo id.
-        if mensaje.identificador and mensaje.identificador in self._ya_contestados:
-            return False
+        #    contestó a tiempo, y el reintento trae el mismo id. Mirar y anotar
+        #    van juntos y bajo candado: si el reintento llega mientras el
+        #    primero todavía pregunta las etiquetas, ya lo encuentra anotado.
+        #    Anotarlo antes de mirar la etiqueta no cambia nada: un reintento
+        #    de un mensaje que atiende una persona tampoco se contesta.
+        if mensaje.identificador:
+            with self._candado_de_ids:
+                if mensaje.identificador in self._ya_contestados:
+                    return False
+                self._ya_contestados.append(mensaje.identificador)
 
         # 4. El traspaso a una persona. Si la conversación tiene la etiqueta,
         #    el bot se calla: la está atendiendo alguien del equipo. Es *el*
@@ -187,9 +200,6 @@ class Chatwoot(Canal):
         #    desde la bandeja, sin tocar el servidor.
         if self._la_atiende_una_persona(evento):
             return False
-
-        if mensaje.identificador:
-            self._ya_contestados.append(mensaje.identificador)
 
         return True
 
@@ -278,6 +288,50 @@ class Chatwoot(Canal):
             for c in respuesta.get("payload") or []
             if isinstance(c, dict)
         )
+
+    def resuelve_sola(self) -> str:
+        """Si la cuenta de Chatwoot resuelve conversaciones sola por inactividad.
+
+        Devuelve cada cuánto (por ejemplo «7 días»), o "" si está apagado o no
+        se puede saber.
+
+        Importa por RESPETAR_RESUELTAS=1: con eso, una conversación resuelta
+        calla al agente con esa persona para siempre. Si Chatwoot resuelve
+        solo, resolver deja de ser una decisión del equipo: cualquier cliente
+        que vuelva después de unos días de silencio queda sin respuesta.
+
+        Chatwoot guardó este ajuste en dos lugares según la versión:
+        `auto_resolve_duration` (en días, las versiones viejas) y
+        `settings.auto_resolve_after` (en minutos, las nuevas).
+
+        Por qué se traga el error: es un chequeo para avisar, no para atender.
+        Si el token no puede leer la cuenta (hace falta uno de administrador)
+        o la versión no trae el dato, el agente atiende igual y no avisa.
+        """
+        try:
+            cuenta = self._api("GET", "")
+        except Exception:
+            return ""
+        if not isinstance(cuenta, dict):
+            return ""
+
+        ajustes = cuenta.get("settings") if isinstance(cuenta.get("settings"), dict) else {}
+        minutos = ajustes.get("auto_resolve_after")
+        if isinstance(minutos, (int, float)) and not isinstance(minutos, bool) and minutos > 0:
+            if minutos % (24 * 60) == 0:
+                dias = int(minutos // (24 * 60))
+                return f"{dias} día{'s' if dias != 1 else ''}"
+            if minutos % 60 == 0:
+                horas = int(minutos // 60)
+                return f"{horas} hora{'s' if horas != 1 else ''}"
+            return f"{int(minutos)} minutos"
+
+        dias = cuenta.get("auto_resolve_duration")
+        if isinstance(dias, (int, float)) and not isinstance(dias, bool) and dias > 0:
+            dias = int(dias)
+            return f"{dias} día{'s' if dias != 1 else ''}"
+
+        return ""
 
     def mensaje(self, conversacion: str, id_mensaje) -> dict | None:
         """Un mensaje de la conversación, por su id: para leer lo que se citó.
@@ -431,7 +485,8 @@ class Chatwoot(Canal):
 
     def _api(self, metodo: str, camino: str, datos: dict | None = None) -> dict:
         """Una llamada a la API de Chatwoot."""
-        url = f"{self.url}/api/v1/accounts/{self.cuenta_id}/{camino}"
+        # Con el camino vacío es la cuenta misma: sin la barra del final.
+        url = f"{self.url}/api/v1/accounts/{self.cuenta_id}/{camino}".rstrip("/")
 
         pedido = urllib.request.Request(
             url,

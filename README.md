@@ -770,6 +770,13 @@ bandeja. Para que la vuelva a atender, reabrila y sacale la etiqueta.
 Si en tu equipo se resuelve de rutina (todo lo que ya se contestó), dejalo
 apagado: si no, el agente se calla con los clientes que vuelven.
 
+**Ojo con la auto-resolución de Chatwoot.** Si tu cuenta resuelve sola las
+conversaciones después de unos días sin actividad (Configuración → Cuenta →
+*Auto resolve conversations*), con `1` el agente deja de contestarle a
+cualquiera que vuelva pasado ese tiempo: para él, resuelta es resuelta, la
+haya resuelto alguien del equipo o Chatwoot solo. Con `1`, apagá esa opción.
+Si queda prendida, el agente te avisa por mail al arrancar.
+
 ```bash
 # 1 = resolver calla al agente con esa persona · 0 = resolver no cambia nada
 RESPETAR_RESUELTAS=1

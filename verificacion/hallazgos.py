@@ -173,7 +173,9 @@ def h2_concurrencia_del_pool() -> tuple[bool, str]:
     modelo_s, envio_s = 1.0, 1.0
     canal = CanalConEnvioLento(envio_s)
     _, cliente = armar(canal, AgenteFalso(modelo_s))
-    hilos = min(32, (os.cpu_count() or 1) + 4)
+    import agente.web.webhook as webhook
+
+    hilos = getattr(webhook, "HILOS", min(32, (os.cpu_count() or 1) + 4))
     with cliente as web:
         inicio = time.monotonic()
         for i in range(n):
@@ -187,27 +189,38 @@ def h2_concurrencia_del_pool() -> tuple[bool, str]:
         f"{n} personas escriben a la vez; cada respuesta tarda {modelo_s:.0f}s de modelo + "
         f"{envio_s:.0f}s de envío. Con hilos ilimitados terminarían en ~{ideal:.0f}s; "
         f"el pool tiene **{hilos} hilos** ({os.cpu_count()} CPU) y tardaron **{total:.1f}s** "
-        f"(previsto por el pool: ~{teorico:.0f}s). La última persona esperó ~{total / ideal:.0f}× más."
+        f"(previsto por el pool: ~{teorico:.0f}s)."
         + ("" if listo else " ⚠️ No terminaron todas dentro del límite de 180s.")
     )
 
 
-def h3_una_resuelta_silencia_al_contacto() -> tuple[bool, str]:
-    """Con RESPETAR_RESUELTAS=1, cualquier conversación resuelta del contacto lo silencia."""
-    canal = ChatwootFalso()
-    canal.resueltas_del_contacto = True  # p. ej. una auto-resuelta por inactividad hace meses
-    _, cliente = armar(canal, AgenteFalso(), respetar_resueltas=1)
-    with cliente as web:
-        web.post(URL, json=evento("Hola, quiero hacer un pedido", conversacion=301, id_mensaje=7001))
-        esperar(lambda: canal.envios() or canal.etiquetas_mandadas(), 3)
-        time.sleep(0.3)
-    sin_respuesta = not canal.envios()
-    etiquetada = any("humano" in e for e in canal.etiquetas_mandadas())
-    confirmado = sin_respuesta and etiquetada
-    return confirmado, (
-        "Un cliente con una conversación vieja resuelta abre una conversación **nueva**: "
-        f"respuestas enviadas = {len(canal.envios())}, etiqueta `humano` puesta = {etiquetada}. "
-        "Si la bandeja auto-resuelve por inactividad, todo cliente que vuelve queda sin bot."
+def h3_auto_resolucion_sin_aviso() -> tuple[bool, str]:
+    """Con RESPETAR_RESUELTAS=1, la auto-resolución de Chatwoot calla al agente con quien vuelve.
+
+    Que una conversación resuelta calle al agente es una decisión del negocio
+    (la pregunta 5 de la instalación). El riesgo es que la resuelva Chatwoot
+    solo, por inactividad, sin que nadie lo sepa. Se confirma si, en ese caso,
+    el agente no avisa.
+    """
+
+    class CuentaQueResuelveSola(ChatwootFalso):
+        def _api(self, metodo, camino, datos=None):
+            if metodo == "GET" and camino == "":
+                return {"settings": {"auto_resolve_after": 7 * 24 * 60}, "auto_resolve_duration": 7}
+            return super()._api(metodo, camino, datos)
+
+    canal = CuentaQueResuelveSola()
+    avisos = AvisosFalsos()
+    config = configuracion(respetar_resueltas=1)
+    app = crear_app(config, agente=AgenteFalso(), canal=canal, avisos=avisos,
+                    tope=TopeDeMensajes(0), lector=Lector(canal))
+    with TestClient(app):
+        esperar(lambda: avisos.mandados, 3)
+    avisado = any("vuelven" in asunto for asunto, _ in avisos.mandados)
+    return not avisado, (
+        "Chatwoot con auto-resolución a los 7 días y `RESPETAR_RESUELTAS=1`: "
+        + ("el agente **avisó por mail al arrancar** y dejó la advertencia en el registro."
+           if avisado else "el agente **no avisó**: los clientes que vuelvan quedan sin respuesta sin que nadie lo sepa.")
     )
 
 
@@ -225,10 +238,12 @@ def h4_estado_que_no_se_libera() -> tuple[bool, str]:
         revisadas = vars_entrante["revisadas"]
         candados = variables_de(vars_entrante["buffer"].al_completar)["candados"]
         tam_revisadas, tam_candados = len(revisadas), len(candados)
-    confirmado = tam_revisadas >= n and tam_candados >= n
+    tope = getattr(revisadas, "tope", None)
+    confirmado = tam_candados > 0 or tope is None
     return confirmado, (
-        f"Después de atender {n} conversaciones ya terminadas: `revisadas` = {tam_revisadas}, "
-        f"`candados` = {tam_candados}. Crecen una por conversación y solo se vacían al reiniciar."
+        f"Después de atender {n} conversaciones ya terminadas: `candados` = {tam_candados}, "
+        f"`revisadas` = {tam_revisadas} "
+        + (f"(con tope de {tope}: se olvida de las más viejas)." if tope else "(sin tope: crece hasta reiniciar).")
     )
 
 
@@ -252,7 +267,7 @@ def h5_buffer_cero_retiene_el_200() -> tuple[bool, str]:
 HALLAZGOS = [
     ("1", "Llamada bloqueante en el event loop (etiquetas)", h1_bloqueo_del_event_loop),
     ("2", "Concurrencia limitada por el pool de hilos", h2_concurrencia_del_pool),
-    ("3", "Una conversación resuelta silencia al contacto para siempre", h3_una_resuelta_silencia_al_contacto),
+    ("3", "Auto-resolución de Chatwoot que calla al agente sin aviso", h3_auto_resolucion_sin_aviso),
     ("4", "Estado en memoria que no se libera", h4_estado_que_no_se_libera),
     ("5", "BUFFER_SEGUNDOS=0 retiene el 200 del webhook", h5_buffer_cero_retiene_el_200),
 ]

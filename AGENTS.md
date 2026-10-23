@@ -132,7 +132,9 @@ Ninguna credencial en el código, ni una. Las claves se leen únicamente en
   se vuelve a probar), `Chatwoot.escribiendo()` y `marcar_visto_y_escribiendo()`
   (cosméticos), `Chatwoot._etiquetas_de()`, `Chatwoot.lo_agarro_otro()` y
   `Chatwoot.ya_la_cerro()` (si no se pueden leer, se responde igual: perder a
-  alguien por una consulta caída es peor), y la lectura de un adjunto en
+  alguien por una consulta caída es peor), `Chatwoot.resuelve_sola()` (es un
+  chequeo para avisar al arrancar: si el token no puede leer la cuenta, se
+  atiende igual sin avisar), y la lectura de un adjunto en
   `Lector` (si una foto o un audio no se pueden leer, el agente pregunta y el
   error va al mail). **No agregues otra sin dejar el motivo escrito al lado.**
 - **Los tests no gastan tokens.** Usan `GenericFakeChatModel`. Si agregás una
@@ -323,6 +325,13 @@ Con `1`, en el webhook de Chatwoot va tildado también el evento
 cuando la persona vuelve a escribir, y la única forma de saber que se había
 resuelto es enterarse en el momento.
 
+Con `1`, además, **preguntale si su Chatwoot resuelve solo por inactividad**
+(Configuración → Cuenta → *Auto resolve conversations*) y, si es así, que lo
+apague: con eso prendido, cualquier cliente que vuelva después de ese tiempo
+se queda sin agente, porque para el agente resuelta es resuelta. Si queda
+prendido, el agente lo detecta al arrancar (`Chatwoot.resuelve_sola()`) y
+manda un mail; si el token no puede leer la cuenta, no lo detecta.
+
 **6. ¿El agente atiende toda la charla, o contesta solo el primer mensaje y
 te la pasa?** → `SOLO_EL_PRIMER_MENSAJE`
 
@@ -453,6 +462,23 @@ Cosas que parecen bugs y no lo son, o que cuestan de encontrar:
 - **Bajar y leer un audio adentro del pedido traba el servidor entero**: nadie
   más es atendido hasta que termina, y Chatwoot reintenta. Por eso la lectura
   va en una tarea aparte, que entra a la ráfaga en su lugar.
+- **`deberia_responder()` corre en un hilo aparte.** Si el evento no trae
+  las etiquetas, el canal se las pregunta a Chatwoot con `urllib`: adentro
+  del event loop, esa espera trababa el servidor entero (ni `/salud`
+  contestaba). Por eso el control de mensajes repetidos va bajo un
+  `threading.Lock`: dos reintentos pueden caer a la vez en dos hilos.
+- **Los hilos de `asyncio.to_thread` son 64 (`HILOS`, `web/webhook.py`).**
+  Los de por defecto son CPUs + 4: en un servidor de 2 núcleos, 6. Cada
+  respuesta ocupa uno mientras piensa el modelo y mientras salen los globos
+  con su pausa, así que la séptima persona que escribía a la vez hacía fila.
+- **Con `BUFFER_SEGUNDOS=0`, `buffer.agregar()` contesta en el momento**
+  (modelo y envío incluidos). Por eso el webhook lo lanza en segundo plano en
+  ese caso: esperarlo demoraba el 200 lo que tardara el modelo. Con buffer,
+  `agregar()` es instantáneo y se espera ahí para mantener el orden.
+- **Lo que se recuerda por conversación tiene tope.** Los candados se borran
+  cuando nadie los usa, y `ultimo_wamid` y `revisadas` son `Recientes`
+  (las últimas 5.000). Sin eso crecían una entrada por conversación hasta el
+  próximo reinicio.
 - **Los puntitos de WhatsApp duran 25 segundos**, y van atados al id del
   mensaje que llegó (`source_id`, empieza con `wamid.`). En una espera larga
   se renuevan cada 20.
@@ -594,7 +620,7 @@ y para mejor: la mitad de las piezas las resuelve Chatwoot.
 | El que charla de más | `frenos.TopeDeMensajes` | `TOPE_MENSAJES_POR_DIA`: al pasarlo, etiqueta `humano`. Poner la etiqueta **suma** a las que ya había: en Chatwoot, mandar etiquetas reemplaza la lista |
 | Fotos, audios, ubicaciones, citas | `canales/adjuntos.py` → `Lector` | Todo a texto, en segundo plano y en su lugar de la ráfaga. Se baja solo de `CHATWOOT_URL` (del evento se usa el camino), con tope de tamaño y reintento si el archivo todavía no está |
 | No contestar arriba de una persona | `Chatwoot.lo_agarro_otro()` | Se vuelve a mirar la conversación antes del modelo y antes de mandar: si le pusieron `humano` o la resolvieron, no contesta |
-| Resolver calla al agente | `Chatwoot.ya_la_cerro()` + el evento `conversation_status_changed` | Con `RESPETAR_RESUELTAS=1`. Las dos piezas hacen falta: una bandeja abre conversación nueva (se mira al contacto), otra reabre la misma (se pone la etiqueta al resolver) |
+| Resolver calla al agente | `Chatwoot.ya_la_cerro()` + el evento `conversation_status_changed` | Con `RESPETAR_RESUELTAS=1`. Las dos piezas hacen falta: una bandeja abre conversación nueva (se mira al contacto), otra reabre la misma (se pone la etiqueta al resolver). Si la cuenta auto-resuelve por inactividad, se avisa por mail al arrancar (`Chatwoot.resuelve_sola()`) |
 | Ritmo de persona | `Chatwoot.enviar()` + `canales/whatsapp_meta.py` | Pausa entre globos (`tarda_en_escribir`), espera opcional, y el visto azul y los puntitos con los datos de Meta |
 | Probar de cero | `POST /reset/<token>` | Borra la memoria y la cuenta del tope de UNA conversación. No hay «todas», a propósito |
 | Textos pegados enormes | `web/webhook.py` | Se recortan a `LARGO_MAXIMO_DE_ENTRADA` antes del modelo: quedan en la memoria y se pagarían en cada mensaje |

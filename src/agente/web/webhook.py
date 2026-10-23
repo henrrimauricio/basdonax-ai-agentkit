@@ -41,7 +41,8 @@ import json
 import logging
 import re
 import secrets
-from collections import defaultdict
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -116,6 +117,65 @@ CAUSA_CHATWOOT = "Chatwoot: revisá CHATWOOT_URL y CHATWOOT_TOKEN en el servidor
 
 UNA_HORA = 60 * 60
 UN_DIA = 24 * UNA_HORA
+
+# Los hilos para lo bloqueante: el modelo, Chatwoot, bajar una foto, las
+# pausas entre globos. Sin esto, asyncio usa los de por defecto, que son
+# (CPUs + 4): en un servidor de 2 núcleos, 6. Cada respuesta ocupa uno
+# mientras el modelo piensa y mientras salen los globos con su pausa (hasta
+# ~15 s con 3 globos), así que con 6 hilos la séptima persona que escribe a
+# la vez ya espera en la fila, y el «escribiendo…» y la segunda mirada de las
+# demás también. Casi todo ese tiempo los hilos están esperando la red, no
+# usando el procesador: 64 cuestan poca memoria y atienden un pico de una
+# campaña sin hacer fila.
+HILOS = 64
+
+# Cuántas conversaciones recientes se recuerdan para el visto azul y para no
+# volver a preguntar si la persona ya tenía una resuelta. Sin tope, son una
+# entrada por conversación hasta el próximo reinicio. Olvidar una vieja no
+# rompe nada: se vuelve a preguntar una vez.
+RECORDADAS = 5000
+
+
+class Recientes(OrderedDict):
+    """Un diccionario que se acuerda solo de los últimos `tope` que se tocaron.
+
+    Sirve también de conjunto (`add`, `discard`, `in`). Al pasar el tope se
+    olvida el que hace más tiempo que no se usa.
+    """
+
+    def __init__(self, tope: int = RECORDADAS) -> None:
+        super().__init__()
+        self.tope = tope
+
+    def __setitem__(self, clave, valor) -> None:
+        if clave in self:
+            self.move_to_end(clave)
+        super().__setitem__(clave, valor)
+        while len(self) > self.tope:
+            self.popitem(last=False)
+
+    def add(self, clave) -> None:
+        self[clave] = True
+
+    def discard(self, clave) -> None:
+        self.pop(clave, None)
+
+
+MAIL_DE_AUTO_RESOLVER = """Tu Chatwoot resuelve solo las conversaciones después de {cada} sin actividad,
+y el agente está configurado con RESPETAR_RESUELTAS=1.
+
+Las dos cosas juntas hacen que el agente deje de contestarle a cualquier
+cliente que vuelva a escribir después de {cada}: para el agente, una
+conversación resuelta es «con esta persona ya terminé», aunque la haya
+resuelto Chatwoot solo y no alguien del equipo.
+
+Para arreglarlo, una de dos:
+· En Chatwoot: Configuración → Cuenta → apagá «Resolver automáticamente
+  las conversaciones» (Auto resolve conversations).
+· O en el servidor: RESPETAR_RESUELTAS=0, si tu equipo no usa «resolver»
+  para cerrar con una persona.
+
+El agente sigue atendiendo. Este aviso sale una vez, al arrancar."""
 
 
 async def mantener_el_permiso(avisos: Avisos, cada: float = UN_DIA) -> None:
@@ -242,7 +302,13 @@ def crear_app(
     # vez sin problema, pero dos mensajes de la MISMA persona no: si se
     # respondieran en paralelo, los dos leerían la memoria en el mismo punto
     # y el segundo pisaría lo que guardó el primero.
-    candados: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+    #
+    # Se borra cuando nadie lo usa (`usos` cuenta quién lo tiene o lo espera):
+    # si no, queda uno por cada conversación que hubo hasta el próximo
+    # reinicio. Todo esto corre en el event loop, un solo hilo: contar así es
+    # seguro.
+    candados: dict[str, asyncio.Lock] = {}
+    usos: dict[str, int] = {}
 
     # Las tareas que corren en segundo plano. Hay que guardarlas: asyncio
     # solo se queda con una referencia débil, y una tarea que nadie guarda
@@ -252,12 +318,12 @@ def crear_app(
     # El último mensaje de WhatsApp de cada conversación: el visto y los
     # puntitos en el celular de la persona van atados a ese id (ver
     # canales/whatsapp_meta.py).
-    ultimo_wamid: dict[str, str] = {}
+    ultimo_wamid: Recientes = Recientes()
 
     # Las conversaciones a las que ya se les miró si esa persona tiene una
     # resuelta. Una vez por conversación alcanza: si estaba cerrada, desde ahí
     # la frena la etiqueta.
-    revisadas: set[str] = set()
+    revisadas: Recientes = Recientes()
 
     def en_segundo_plano(corrutina) -> asyncio.Task:
         tarea = asyncio.create_task(corrutina)
@@ -307,86 +373,98 @@ def crear_app(
         return True
 
     async def responder(conversacion: str, texto: str) -> None:
-        """Le pasa la ráfaga al agente y manda la respuesta por Chatwoot."""
-        async with candados[conversacion]:
-            if len(texto) > config.largo_maximo_de_entrada:
-                registro.warning(
-                    "[%s] entraron %s caracteres, se recortan a %s",
-                    conversacion,
-                    len(texto),
-                    config.largo_maximo_de_entrada,
-                )
-                texto = texto[: config.largo_maximo_de_entrada]
+        """Le pasa la ráfaga al agente y manda la respuesta por Chatwoot, de a una por conversación."""
+        candado = candados.setdefault(conversacion, asyncio.Lock())
+        usos[conversacion] = usos.get(conversacion, 0) + 1
+        try:
+            async with candado:
+                await _responder(conversacion, texto)
+        finally:
+            usos[conversacion] -= 1
+            if not usos[conversacion]:
+                del usos[conversacion]
+                del candados[conversacion]
 
-            registro.info("[%s] %s", conversacion, _CONTROL.sub(" ", texto)[:200])
+    async def _responder(conversacion: str, texto: str) -> None:
+        """Lo que se hace con la ráfaga, ya con el candado de esa conversación."""
+        if len(texto) > config.largo_maximo_de_entrada:
+            registro.warning(
+                "[%s] entraron %s caracteres, se recortan a %s",
+                conversacion,
+                len(texto),
+                config.largo_maximo_de_entrada,
+            )
+            texto = texto[: config.largo_maximo_de_entrada]
+
+        registro.info("[%s] %s", conversacion, _CONTROL.sub(" ", texto)[:200])
+
+        try:
+            # El "escribiendo..." y el agente son código bloqueante (urllib
+            # y el modelo). Van a un hilo aparte para no trabar el servidor:
+            # mientras este mensaje se piensa, los demás siguen entrando.
+            await esperar_como_persona(conversacion)
+
+            # Se vuelve a mirar ANTES del modelo: si ya no le toca, no se
+            # gasta ni un token.
+            if await ya_no_le_toca(conversacion):
+                return
+
+            primera = config.solo_el_primer_mensaje and not await asyncio.to_thread(
+                agente.historial, conversacion
+            )
 
             try:
-                # El "escribiendo..." y el agente son código bloqueante (urllib
-                # y el modelo). Van a un hilo aparte para no trabar el servidor:
-                # mientras este mensaje se piensa, los demás siguen entrando.
-                await esperar_como_persona(conversacion)
-
-                # Se vuelve a mirar ANTES del modelo: si ya no le toca, no se
-                # gasta ni un token.
-                if await ya_no_le_toca(conversacion):
-                    return
-
-                primera = config.solo_el_primer_mensaje and not await asyncio.to_thread(
-                    agente.historial, conversacion
+                respuesta = await asyncio.to_thread(
+                    agente.responder, texto, conversacion
                 )
+            except Exception as e:
+                await algo_se_rompio(conversacion, e, CAUSA_MODELO, "modelo")
+                return
 
-                try:
-                    respuesta = await asyncio.to_thread(
-                        agente.responder, texto, conversacion
-                    )
-                except Exception as e:
-                    await algo_se_rompio(conversacion, e, CAUSA_MODELO, "modelo")
-                    return
-
-                mensajes = partir_respuesta(
-                    respuesta.texto, maximo=config.mensajes_por_respuesta
+            mensajes = partir_respuesta(
+                respuesta.texto, maximo=config.mensajes_por_respuesta
+            )
+            if not mensajes:
+                # Una respuesta vacía también es una falla: sin esto, la
+                # persona se queda esperando y nadie se entera.
+                await algo_se_rompio(
+                    conversacion,
+                    ValueError("El modelo devolvió una respuesta vacía."),
+                    CAUSA_MODELO,
+                    "modelo",
                 )
-                if not mensajes:
-                    # Una respuesta vacía también es una falla: sin esto, la
-                    # persona se queda esperando y nadie se entera.
-                    await algo_se_rompio(
-                        conversacion,
-                        ValueError("El modelo devolvió una respuesta vacía."),
-                        CAUSA_MODELO,
-                        "modelo",
-                    )
-                    return
+                return
 
-                # Y una vez más con la respuesta escrita: el modelo tarda unos
-                # segundos, y es el último momento en que se puede no mandar.
-                if await ya_no_le_toca(conversacion):
-                    return
+            # Y una vez más con la respuesta escrita: el modelo tarda unos
+            # segundos, y es el último momento en que se puede no mandar.
+            if await ya_no_le_toca(conversacion):
+                return
 
+            try:
+                await asyncio.to_thread(
+                    canal.enviar,
+                    conversacion,
+                    mensajes,
+                    (lambda: visto_y_escribiendo(conversacion)) if con_meta else None,
+                    tarda_en_escribir if config.pausa_entre_globos else None,
+                )
+            except Exception as e:
+                await algo_se_rompio(conversacion, e, CAUSA_CHATWOOT, "envio")
+                return
+
+            registro.info("[%s] -> %s mensaje(s)", conversacion, len(mensajes))
+
+            if primera:
+                # Lo eligió al instalar: el agente abre la charla y la sigue
+                # una persona. Va después de mandar: si el envío fallaba, la
+                # persona quedaba sin respuesta y sin nadie que la atienda.
                 try:
-                    await asyncio.to_thread(
-                        canal.enviar,
-                        conversacion,
-                        mensajes,
-                        (lambda: visto_y_escribiendo(conversacion)) if con_meta else None,
-                        tarda_en_escribir if config.pausa_entre_globos else None,
-                    )
+                    await asyncio.to_thread(canal.pasar_a_persona, conversacion)
+                    registro.info("[%s] contestó el primero: sigue una persona", conversacion)
                 except Exception as e:
-                    await algo_se_rompio(conversacion, e, CAUSA_CHATWOOT, "envio")
-                    return
-
-                registro.info("[%s] -> %s mensaje(s)", conversacion, len(mensajes))
-
-                if primera:
-                    # Lo eligió al instalar: el agente abre la charla y la sigue
-                    # una persona. Va después de mandar: si el envío fallaba, la
-                    # persona quedaba sin respuesta y sin nadie que la atienda.
-                    try:
-                        await asyncio.to_thread(canal.pasar_a_persona, conversacion)
-                        registro.info("[%s] contestó el primero: sigue una persona", conversacion)
-                    except Exception as e:
-                        registro.error("[%s] no se pudo pasar a una persona: %s", conversacion, e)
-            finally:
-                await asyncio.to_thread(canal.escribiendo, conversacion, False)
+                    registro.error("[%s] no se pudo pasar a una persona: %s", conversacion, e)
+        finally:
+            await asyncio.to_thread(canal.escribiendo, conversacion, False)
 
     async def algo_se_rompio(conversacion: str, error: Exception, causa: str, tipo: str) -> None:
         """El modelo o Chatwoot fallaron: el equipo se entera, el cliente no.
@@ -507,11 +585,33 @@ def crear_app(
 
     buffer = BufferDeMensajes(config.buffer_segundos, responder)
 
+    async def avisar_si_chatwoot_resuelve_solo() -> None:
+        """RESPETAR_RESUELTAS=1 con la auto-resolución de Chatwoot prendida calla al agente."""
+        cada = await asyncio.to_thread(canal.resuelve_sola)
+        if not cada:
+            return
+        registro.warning(
+            "Chatwoot resuelve solo las conversaciones cada %s y RESPETAR_RESUELTAS=1: "
+            "el agente no le va a contestar a quien vuelva después de ese tiempo.",
+            cada,
+        )
+        await asyncio.to_thread(
+            avisos.avisar,
+            "El agente va a dejar de contestarles a los clientes que vuelven",
+            MAIL_DE_AUTO_RESOLVER.format(cada=cada),
+            "auto-resolver",
+        )
+
     @asynccontextmanager
     async def ciclo_de_vida(app: FastAPI):
         # Acá y no antes: uvicorn arma sus registros al arrancar, y un filtro
         # puesto antes de eso se puede perder.
         tapar_el_token_en_los_registros(config.chatwoot_webhook_token)
+
+        # Los hilos de asyncio.to_thread, para este servidor (ver HILOS).
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=HILOS, thread_name_prefix="agente")
+        )
 
         registro.info(
             "Agente escuchando - %s / %s - memoria %s - buffer %ss - "
@@ -533,6 +633,10 @@ def crear_app(
             if avisos.activos and avisos.metodo == "google"
             else None
         )
+        if config.respetar_resueltas:
+            # En segundo plano: preguntarle a Chatwoot no puede demorar el
+            # arranque, y si no contesta, el agente arranca igual.
+            en_segundo_plano(avisar_si_chatwoot_resuelve_solo())
         yield
         if cuidar_el_permiso is not None:
             cuidar_el_permiso.cancel()
@@ -653,7 +757,11 @@ def crear_app(
 
         entrante = canal.traducir(evento)
 
-        if entrante is None or not canal.deberia_responder(entrante):
+        # En un hilo aparte: si el evento no trae las etiquetas, el canal se
+        # las pregunta a Chatwoot, y esa espera (hasta 20 s si anda lento)
+        # adentro del event loop trababa el servidor entero — ni /salud
+        # contestaba, y Coolify podía reiniciar el contenedor.
+        if entrante is None or not await asyncio.to_thread(canal.deberia_responder, entrante):
             # No es un error: es la mayoría de lo que llega. Cada respuesta
             # que manda el propio agente vuelve como un evento más.
             return JSONResponse({"estado": "ignorado"})
@@ -676,11 +784,21 @@ def crear_app(
         if revisar:
             revisadas.add(entrante.conversacion)
         leer = Lector.hay_que_leer(entrante)
-        if revisar or leer:
-            parte = en_segundo_plano(preparar(entrante, revisar, leer))
+        parte = (
+            en_segundo_plano(preparar(entrante, revisar, leer))
+            if revisar or leer
+            else entrante.texto
+        )
+        if buffer.segundos > 0:
+            # Con buffer, agregar es instantáneo (deja corriendo un reloj) y
+            # va acá para que la ráfaga quede en orden de llegada.
             await buffer.agregar(entrante.conversacion, parte)
         else:
-            await buffer.agregar(entrante.conversacion, entrante.texto)
+            # Sin buffer, agregar contesta en el momento: modelo y envío
+            # incluidos. Esperarlo acá demoraba el 200 lo que tardara el
+            # modelo, y Chatwoot puede dar el webhook por fallado. El orden se
+            # mantiene igual: el candado de la conversación atiende en orden.
+            en_segundo_plano(buffer.agregar(entrante.conversacion, parte))
 
         return JSONResponse({"estado": "recibido"})
 

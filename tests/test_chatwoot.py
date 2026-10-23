@@ -1314,3 +1314,175 @@ def test_una_parte_que_no_dejo_nada_no_se_contesta():
     asyncio.run(correr())
 
     assert sueltos == []
+
+
+# -- Para producción: que el servidor no se trabe ni se llene -------------------
+
+
+def _variables_de(funcion) -> dict:
+    """Lo que una función armada adentro de crear_app tiene guardado."""
+    return {
+        nombre: celda.cell_contents
+        for nombre, celda in zip(funcion.__code__.co_freevars, funcion.__closure__ or ())
+    }
+
+
+def test_preguntar_las_etiquetas_no_traba_el_servidor():
+    """Un evento sin etiquetas obliga a preguntarlas: eso no puede frenar a los demás.
+
+    Antes la consulta corría adentro del event loop: mientras Chatwoot tardaba
+    en contestar, el servidor entero quedaba quieto (ni /salud contestaba).
+    """
+    import threading
+    import time
+
+    from test_agente import agente_falso
+
+    class EtiquetasLentas(ChatwootFalso):
+        def _api(self, metodo, camino, datos=None):
+            if metodo == "GET" and camino.endswith("/labels"):
+                time.sleep(1.5)
+            return super()._api(metodo, camino, datos)
+
+    canal = EtiquetasLentas()
+    crudo = evento("hola", conversacion=61)
+    del crudo["conversation"]["labels"]
+
+    with cliente(canal, agente_falso(["hola"])) as web:
+        hilo = threading.Thread(target=lambda: web.post(f"/chatwoot/{TOKEN}", json=crudo))
+        hilo.start()
+        time.sleep(0.3)
+        inicio = time.monotonic()
+        assert web.get("/salud").status_code == 200
+        demora = time.monotonic() - inicio
+        hilo.join()
+
+    assert demora < 0.7, f"/salud tardó {demora:.2f}s: la consulta de etiquetas trabó el servidor"
+
+
+def test_sin_buffer_el_200_no_espera_al_modelo():
+    """Con BUFFER_SEGUNDOS=0, Chatwoot tiene que recibir el 200 al toque igual."""
+    import time
+
+    from test_agente import agente_falso
+
+    canal = ChatwootFalso()
+    agente = agente_falso(["¡Hola!"])
+    original = agente.responder
+
+    def lento(texto, conversacion="local"):
+        time.sleep(1.5)
+        return original(texto, conversacion)
+
+    agente.responder = lento
+
+    with cliente(canal, agente, buffer_segundos=0) as web:
+        inicio = time.monotonic()
+        respuesta = web.post(f"/chatwoot/{TOKEN}", json=evento("hola", conversacion=62))
+        demora = time.monotonic() - inicio
+        assert esperar(lambda: canal.envios(), segundos=5)
+
+    assert respuesta.json()["estado"] == "recibido"
+    assert demora < 1.0, f"el 200 tardó {demora:.2f}s: esperó al modelo"
+    assert canal.envios() == ["¡Hola!"]
+
+
+def test_los_candados_se_sueltan_al_terminar():
+    """Un candado por conversación, pero solo mientras se la atiende."""
+    from test_agente import agente_falso
+
+    canal = ChatwootFalso()
+    agente = agente_falso([f"respuesta {i}" for i in range(5)])
+
+    with cliente(canal, agente) as web:
+        for i in range(5):
+            web.post(f"/chatwoot/{TOKEN}", json=evento("hola", conversacion=700 + i, id_mensaje=700 + i))
+        assert esperar(lambda: len(canal.envios()) == 5, segundos=5)
+        entrante = next(r.endpoint for r in web.app.routes if getattr(r, "path", "") == "/chatwoot/{token}")
+        responder = _variables_de(entrante)["buffer"].al_completar
+        candados = _variables_de(responder)["candados"]
+
+    assert candados == {}, "quedaron candados de conversaciones que ya terminaron"
+
+
+def test_recientes_se_olvida_de_las_mas_viejas():
+    from agente.web.webhook import Recientes
+
+    recientes = Recientes(tope=3)
+    for conversacion in ("1", "2", "3"):
+        recientes.add(conversacion)
+    recientes["1"] = True  # tocarla la hace reciente de nuevo
+    recientes.add("4")
+
+    assert list(recientes) == ["3", "1", "4"], "se fue la que hacía más que no se tocaba"
+    recientes.discard("3")
+    recientes.discard("no-estaba")
+    assert list(recientes) == ["1", "4"]
+
+
+class ChatwootQueResuelveSolo(ChatwootFalso):
+    """Una cuenta de Chatwoot con la auto-resolución prendida."""
+
+    def __init__(self, cuenta: dict):
+        super().__init__()
+        self.cuenta = cuenta
+
+    def _api(self, metodo, camino, datos=None):
+        if metodo == "GET" and camino == "":
+            self.llamadas.append({"metodo": metodo, "camino": camino, "datos": datos})
+            return self.cuenta
+        return super()._api(metodo, camino, datos)
+
+
+@pytest.mark.parametrize(
+    "cuenta, esperado",
+    [
+        ({"settings": {"auto_resolve_after": 7 * 24 * 60}}, "7 días"),
+        ({"settings": {"auto_resolve_after": 60}}, "1 hora"),
+        ({"settings": {"auto_resolve_after": 90}}, "90 minutos"),
+        ({"auto_resolve_duration": 1}, "1 día"),
+        ({"settings": {"auto_resolve_after": None}, "auto_resolve_duration": None}, ""),
+        ({"settings": {"auto_resolve_after": 0}}, ""),
+        ({"id": 1}, ""),
+    ],
+)
+def test_resuelve_sola_lee_las_dos_formas_de_chatwoot(cuenta, esperado):
+    assert ChatwootQueResuelveSolo(cuenta).resuelve_sola() == esperado
+
+
+def test_resuelve_sola_sin_permiso_no_rompe(monkeypatch):
+    """El token puede no tener permiso para leer la cuenta: no se avisa y se sigue."""
+    canal = ChatwootFalso()
+
+    def falla(*a, **k):
+        raise RuntimeError("401")
+
+    monkeypatch.setattr(canal, "_api", falla)
+    assert canal.resuelve_sola() == ""
+
+
+def test_avisa_si_chatwoot_resuelve_solo_y_resolver_calla_al_agente():
+    from test_agente import agente_falso
+
+    canal = ChatwootQueResuelveSolo({"settings": {"auto_resolve_after": 7 * 24 * 60}})
+    avisos = AvisosFalsos()
+
+    with cliente(canal, agente_falso([]), avisos=avisos, respetar_resueltas=True):
+        assert esperar(lambda: avisos.mandados), "tendría que haber avisado al arrancar"
+
+    asunto, cuerpo = avisos.mandados[0]
+    assert "clientes que vuelven" in asunto
+    assert "7 días" in cuerpo and "RESPETAR_RESUELTAS=0" in cuerpo
+
+
+def test_sin_respetar_resueltas_no_pregunta_por_la_auto_resolucion():
+    from test_agente import agente_falso
+
+    canal = ChatwootQueResuelveSolo({"settings": {"auto_resolve_after": 7 * 24 * 60}})
+    avisos = AvisosFalsos()
+
+    with cliente(canal, agente_falso([]), avisos=avisos, respetar_resueltas=False):
+        esperar(lambda: avisos.mandados, segundos=0.3)
+
+    assert avisos.mandados == []
+    assert not any(l["camino"] == "" for l in canal.llamadas)
